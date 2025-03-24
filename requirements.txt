@@ -1,0 +1,6 @@
+gradio==5.22.0
+numpy==2.2.4
+opencv_python==4.11.0.86
+Pillow==11.1.0
+torch
+torchvision
