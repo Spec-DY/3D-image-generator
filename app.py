@@ -42,12 +42,11 @@ def segment_person(img_data, model):
         cv2.imwrite(temp_path, cv2.cvtColor(img_data, cv2.COLOR_RGB2BGR))
 
     try:
-
         input_image = Image.open(temp_path).convert("RGB")
         preprocess = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[
-                                 0.229, 0.224, 0.225]),
+                                    0.229, 0.224, 0.225]),
         ])
         input_tensor = preprocess(input_image)
         input_batch = input_tensor.unsqueeze(0)
@@ -64,6 +63,12 @@ def segment_person(img_data, model):
         kernel = np.ones((5, 5), np.uint8)
         person_mask = cv2.morphologyEx(person_mask, cv2.MORPH_CLOSE, kernel)
         person_mask = cv2.morphologyEx(person_mask, cv2.MORPH_OPEN, kernel)
+
+        # Error handling: Check if the person mask covers at least 1% of the image area.
+        mask_pixels = cv2.countNonZero(person_mask)
+        total_pixels = person_mask.shape[0] * person_mask.shape[1]
+        if mask_pixels < 0.01 * total_pixels:
+            raise ValueError("No person detected in the image. Please upload a different image.")
 
         original_image = cv2.imread(temp_path)
         original_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
@@ -239,79 +244,58 @@ def create_anaglyph(left_img, right_img):
 def process_image(input_image, depth_level, x_position, y_position, scale_factor, auto_scale=True):
     """
     Segments a person from the input image and overlays them onto a stereo background to create an anaglyph image.
-
-    Parameters:
-        input_image (PIL.Image): The image containing a person.
-        depth_level (str): Depth level ("close", "medium", "far") that determines the stereo disparity.
-        x_position (int/float): Horizontal offset for positioning.
-        y_position (int/float): Vertical offset for positioning.
-        scale_factor (float): Additional scaling factor for the segmented person.
-        auto_scale (bool): If True, automatically scales the person to fit the background (default True).
-
+    If no valid person is detected during segmentation, a warning message is returned.
+    
     Returns:
-        tuple: (segmented_person, anaglyph)
+        tuple: (segmented_person, anaglyph, warning_message)
+            - segmented_person (numpy.ndarray or None): The segmented person RGBA image.
+            - anaglyph (numpy.ndarray or None): The generated anaglyph image.
+            - warning_message (str): A warning message if an error occurred; empty otherwise.
     """
     try:
         model = load_segmentation_model()
         segmented_person = segment_person(np.array(input_image), model)
     except Exception as e:
-        print(f"Error during segmentation: {e}")
+        # Return immediately with a warning message if segmentation fails.
+        return None, None, f"Error during segmentation: {e}"
 
-        original_rgb = np.array(input_image)
-        h, w = original_rgb.shape[:2]
-
-        mask = np.zeros((h, w), dtype=np.uint8)
-        center_h, center_w = h//2, w//2
-        mask[center_h-h//4:center_h+h//4, center_w-w//4:center_w+w//4] = 255
-
-        segmented_person = np.zeros((h, w, 4), dtype=np.uint8)
-        segmented_person[:, :, :3] = original_rgb
-        segmented_person[:, :, 3] = mask
-
-    # Split stereo image into left and right
     try:
         stereo_left, stereo_right = split_stereo_image(SCENE_IMAGE_PATH)
     except FileNotFoundError:
-        print(
-            f"Scene image not found at {SCENE_IMAGE_PATH}. Using a default background.")
-        # If scene.jpg not found, use a default color as background
+        print(f"Scene image not found at {SCENE_IMAGE_PATH}. Using a default background.")
         h, w = segmented_person.shape[:2]
-        stereo_left = np.ones((h, w, 3), dtype=np.uint8) * \
-            128  # Gray background
+        stereo_left = np.ones((h, w, 3), dtype=np.uint8) * 128  # Gray background
         stereo_right = stereo_left.copy()
 
     if auto_scale:
-        segmented_person, auto_scale_factor = auto_scale_person(
-            segmented_person, stereo_left, 0.7)
+        segmented_person, auto_scale_factor = auto_scale_person(segmented_person, stereo_left, target_height_ratio=0.7)
         print(f"Auto-scaled person with ratio: {auto_scale_factor:.2f}")
-        # Apply additional scaling if specified by user
         if scale_factor != 1.0:
             h, w = segmented_person.shape[:2]
             new_h, new_w = int(h * scale_factor), int(w * scale_factor)
             segmented_person = cv2.resize(segmented_person, (new_w, new_h))
     else:
-
         h, w = segmented_person.shape[:2]
         new_h, new_w = int(h * scale_factor), int(w * scale_factor)
         segmented_person = cv2.resize(segmented_person, (new_w, new_h))
 
+    warning_message = ""
     try:
         _, _, anaglyph = insert_into_stereo_image(
             segmented_person, stereo_left, stereo_right, depth_level,
-            int(x_position), int(y_position), 1.0
+            int(x_position), int(y_position), scale_factor=1.0
         )
     except Exception as e:
-        print(f"Error during stereo insertion: {e}")
+        warning_message += f"Error during stereo insertion: {e}"
         anaglyph = create_anaglyph(stereo_left, stereo_right)
 
-    return segmented_person, anaglyph
+    return segmented_person, anaglyph, warning_message
 
 
 def create_gradio_interface():
     with gr.Blocks(title="3D Image Composer") as app:
         gr.Markdown("# 3D Image Composer")
-        gr.Markdown(
-            "Upload an image with a person to create an anaglyph 3D image.")
+        gr.Markdown("Upload an image with a person to create an anaglyph 3D image.")
 
         with gr.Row():
             with gr.Column():
@@ -322,20 +306,21 @@ def create_gradio_interface():
                     value="medium"
                 )
                 x_position = gr.Slider(
-                    minimum=0, maximum=1000, value=200, step=10, label="Horizontal Position")
+                    minimum=0, maximum=1000, value=200, step=10, label="Horizontal Position"
+                )
                 y_position = gr.Slider(
-                    minimum=0, maximum=1000, value=1000, step=10, label="Vertical Position")
-                auto_scale_checkbox = gr.Checkbox(
-                    label="Auto-scale person to fit scene", value=True)
-                scale_factor = gr.Slider(minimum=0.1, maximum=2.0, value=1.0, step=0.1,
-                                         label="Additional scale factor")
-
+                    minimum=0, maximum=1000, value=1000, step=10, label="Vertical Position"
+                )
+                auto_scale_checkbox = gr.Checkbox(label="Auto-scale person to fit scene", value=True)
+                scale_factor = gr.Slider(
+                    minimum=0.1, maximum=2.0, value=1.0, step=0.1, label="Additional scale factor"
+                )
                 process_btn = gr.Button("Process Image")
 
             with gr.Column():
                 segmented_output = gr.Image(label="Segmented Person")
-                anaglyph_output = gr.Image(
-                    label="Anaglyph Image (Use red-cyan glasses)")
+                anaglyph_output = gr.Image(label="Anaglyph Image (Use red-cyan glasses)")
+                warning_output = gr.Textbox(label="Warning Message")
 
         gr.Markdown("### Instructions")
         gr.Markdown("""
@@ -344,14 +329,13 @@ def create_gradio_interface():
         3. Adjust the position of the person in the scene.
         4. Choose whether to auto-scale the person to fit the scene.
         5. Click 'Process Image' to generate the 3D anaglyph.
-        6. View the final anaglyph image with red-cyan 3D glasses.
+        6. If there are issues (e.g. no person detected), a warning message will appear.
         """)
 
         process_btn.click(
             fn=process_image,
-            inputs=[input_image, depth_choice, x_position, y_position,
-                    scale_factor, auto_scale_checkbox],
-            outputs=[segmented_output, anaglyph_output]
+            inputs=[input_image, depth_choice, x_position, y_position, scale_factor, auto_scale_checkbox],
+            outputs=[segmented_output, anaglyph_output, warning_output]
         )
 
     return app
